@@ -1,60 +1,192 @@
-name: Android CI
+name: Android Release
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the APK to GitHub Releases
+        type: boolean
+        default: true
   push:
     branches: ["main"]
-    tags:
-      - "v*"
+    tags: ["v*"]
     paths-ignore:
       - "README.md"
-      - "doc/*"
-      - ".github/workflows/android.yml"
+      - "docs/**"
+      - "doc/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up JDK 21
         uses: actions/setup-java@v5
         with:
-          distribution: "zulu"
+          distribution: zulu
           java-version: "21"
+
+      - name: Validate and prepare signing key
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEYSTORE_PASS: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in SIGNING_KEY KEYSTORE_PASS KEY_ALIAS KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing signing values: ${missing[*]}. Configure SIGNING_KEY, KEY_STORE_PASSWORD, ALIAS and KEY_PASSWORD in Settings > Secrets and variables > Actions. See docs/android-release.md."
+            exit 1
+          fi
+
+          umask 077
+          keystore="$RUNNER_TEMP/appmarket-signing.jks"
+          check_store="$RUNNER_TEMP/appmarket-signing-check.p12"
+          printf '%s' "$SIGNING_KEY" | base64 --decode > "$keystore"
+          if [[ ! -s "$keystore" ]]; then
+            echo "::error::SIGNING_KEY decoded to an empty file."
+            exit 1
+          fi
+          # Decrypt the private key once to check the store, alias and both passwords.
+          keytool -importkeystore -noprompt \
+            -srckeystore "$keystore" \
+            -srcstorepass:env KEYSTORE_PASS \
+            -srcalias "$KEY_ALIAS" \
+            -srckeypass:env KEY_PASSWORD \
+            -destkeystore "$check_store" \
+            -deststoretype PKCS12 \
+            -deststorepass:env KEYSTORE_PASS \
+            -destkeypass:env KEYSTORE_PASS
+          rm -f -- "$check_store"
+          echo "KEYSTORE_PATH=$keystore" >> "$GITHUB_ENV"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Decode Signing Key
-        run: echo ${{ secrets.SIGNING_KEY }} | base64 -d > keystore.jks
-
       - name: Build Release APK
-        run: |
-          ./gradlew :app:android:assembleRelease
-          echo "APK_FILE=$(find app/android/build/outputs/apk/release -name '*.apk' | head -n 1)" >> $GITHUB_ENV
+        shell: bash
         env:
-          KEYSTORE_PATH: ${{ github.workspace }}/keystore.jks
           KEYSTORE_PASS: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --no-configuration-cache :app:android:assembleRelease
 
-      - name: Upload APK Artifact
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Verify APK signature and collect files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' apks < <(find app/android/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print0)
+          if (( ${#apks[@]} != 1 )); then
+            echo "::error::Expected one release APK; found ${#apks[@]}."
+            exit 1
+          fi
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [[ -z "$sdk_root" || ! -d "$sdk_root/build-tools" ]]; then
+            echo "::error::Android SDK build-tools were not found."
+            exit 1
+          fi
+          apksigner=$(find "$sdk_root/build-tools" -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)
+          if [[ -z "$apksigner" || ! -x "$apksigner" ]]; then
+            echo "::error::apksigner was not found in Android SDK build-tools."
+            exit 1
+          fi
+          mkdir -p dist
+          cp -- "${apks[0]}" dist/
+          "$apksigner" verify --verbose --print-certs "${apks[0]}" > dist/apk-signature.txt
+          (cd dist && sha256sum -- *.apk > SHA256SUMS.txt)
+          {
+            echo '### Release APK verified'
+            echo 'Download the AppMarket-release artifact below, or use Releases when publishing is enabled.'
+            echo
+            echo '```text'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        id: upload
         uses: actions/upload-artifact@v7
         with:
-          path: ${{ env.APK_FILE }}
-          archive: false
+          name: AppMarket-release-${{ github.run_number }}-${{ github.run_attempt }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
 
-      - name: Display APK Hashes
+      - name: Remove temporary signing files
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f -- "$RUNNER_TEMP/appmarket-signing.jks" "$RUNNER_TEMP/appmarket-signing-check.p12"
+
+  publish:
+    needs: build
+    if: ${{ startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_release) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+    steps:
+      - name: Download verified APK artifact
+        shell: bash
         run: |
-          echo "### APK Hashes" >> $GITHUB_STEP_SUMMARY
-          echo "| Hash Type | Hash Value |" >> $GITHUB_STEP_SUMMARY
-          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
-          echo "| SHA256 | \`$(sha256sum "$APK_FILE" | awk '{ print $1 }')\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| SHA1 | \`$(sha1sum "$APK_FILE" | awk '{ print $1 }')\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| MD5 | \`$(md5sum "$APK_FILE" | awk '{ print $1 }')\` |" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          if [[ ! "$ARTIFACT_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::The build job did not return an artifact ID."
+            exit 1
+          fi
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID/zip" > "$RUNNER_TEMP/appmarket-artifact.zip"
+          unzip -q "$RUNNER_TEMP/appmarket-artifact.zip" -d dist
+
+      - name: Publish GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check SHA256SUMS.txt)
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            release_tag="$GITHUB_REF_NAME"
+            tag_options=(--verify-tag)
+          else
+            release_tag="build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+            tag_options=(--target "$GITHUB_SHA")
+          fi
+          {
+            echo 'Personal AppMarket build with a persistent signing key.'
+            echo
+            echo "Source commit: $GITHUB_SHA"
+            echo "Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo 'Download the APK asset to install. SHA256SUMS.txt and apk-signature.txt contain verification details.'
+          } > release-notes.md
+          gh release create "$release_tag" dist/* \
+            "${tag_options[@]}" \
+            --title "AppMarket $release_tag" \
+            --notes-file release-notes.md
